@@ -11,8 +11,11 @@ export function publicError(error) {
 }
 export const MAX_BODY = 1024 * 1024;
 const sensitive = /cookie|authorization|password|passwd|secret|token|signature|credential|csrf|session|api.?key|__proto__|constructor|prototype/i;
+const credentialSlot = (object, key) => object && typeof object === 'object' && ['value','val','filterValue','stringValue','numberValue'].includes(key) && ['key','name','field','fieldName','filterKey','filterName'].map(label => object[label]).find(label => typeof label === 'string' && sensitive.test(label));
 export const safeKey = key => typeof key === 'string' && /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(key) && !sensitive.test(key);
 export const digest = text => createHash('sha256').update(text).digest('hex');
+export const replayHeaders = headers => Object.fromEntries(Object.entries(headers).filter(([key]) => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) && !/^(cookie|host|connection|content-length|accept-encoding|proxy-.*|sec-.*)$/i.test(key)));
+const fieldPath = value => typeof value === 'string' && value.length <= 512 && value.split('.').every(part => safeKey(part) || /^(0|[1-9]\d*)$/.test(part));
 
 export function allowedURL(value, origins) {
   let url;
@@ -41,14 +44,15 @@ export function dataShape(value, secrets = new Set(), depth = 0, budget = { node
   if (typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([key]) => safeKey(key) && !hasSecret(key, secrets)).slice(0, 40).map(([key, val]) => [key, dataShape(val, secrets, depth + 1, budget)]));
   return typeof value;
 }
-export function rememberSecrets(value, secrets, key = '', depth = 0, budget = { nodes: 0 }) {
+export function rememberSecrets(value, secrets, key = '', depth = 0, budget = { nodes: 0 }, inherited = false) {
   requireThat(depth <= 20 && ++budget.nodes <= 20000, 'DATA_TOO_COMPLEX');
   function add(secret) {
     if (secret.length < 4 || secret.length > 4096) return;
     requireThat(secrets.has(secret) || secrets.size < 256, 'SECRET_BUDGET_EXCEEDED');
     secrets.add(secret);
   }
-  if (['string', 'number'].includes(typeof value) && sensitive.test(key)) {
+  const selected = inherited || sensitive.test(key);
+  if (['string', 'number'].includes(typeof value) && selected) {
     const text = String(value); add(text);
     if (/^Bearer /i.test(text)) add(text.slice(7));
     if (/cookie/i.test(key)) for (const part of text.split(';')) {
@@ -56,7 +60,7 @@ export function rememberSecrets(value, secrets, key = '', depth = 0, budget = { 
       if (index >= 0) add(part.slice(index + 1).trim());
     }
   } else if (value && typeof value === 'object') {
-    for (const [childKey, child] of Object.entries(value)) rememberSecrets(child, secrets, childKey, depth + 1, budget);
+    for (const [childKey, child] of Object.entries(value)) rememberSecrets(child, secrets, selected ? key : (credentialSlot(value, childKey) || childKey), depth + 1, budget, selected);
   }
 }
 export function authenticationFingerprint(...inputs) {
@@ -66,7 +70,10 @@ export function authenticationFingerprint(...inputs) {
     if (value && typeof value === 'object') {
       const entries = Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
       if (selected && !entries.length) hash.update(JSON.stringify([path, value]) + '\0');
-      for (const [key, child] of entries) visit(child, [...path, key], selected || sensitive.test(key));
+      for (const [key, child] of entries) {
+        const label = credentialSlot(value, key);
+        visit(child, label ? [...path, key, label] : [...path, key], selected || sensitive.test(key) || Boolean(label));
+      }
     } else if (selected) hash.update(JSON.stringify([path, value]) + '\0');
   }
   inputs.forEach((value, index) => visit(value, [index]));
@@ -76,6 +83,7 @@ export function previewValue(value, secrets) {
   if (value !== null && ['string', 'number', 'boolean'].includes(typeof value) && hasSecret(value, secrets)) return '[redacted]';
   if (typeof value === 'string') {
     if (value.length > 240 || /https?:\/\/|bearer\s|eyJ[A-Za-z0-9_-]+\.|[A-Za-z0-9_-]{32,}|[\u0000-\u001f]/i.test(value) || [...secrets].some(secret => value.includes(secret))) return '[redacted]';
+    if (/^\s*[\[{]/.test(value)) { try { const parsed = JSON.parse(value); if (parsed && typeof parsed === 'object') return '[structured-value]'; } catch {} }
     return value;
   }
   return value === null || typeof value === 'boolean' || typeof value === 'number' ? value : '[structured-value]';
@@ -85,7 +93,8 @@ export function atPointer(value, pointer) {
   for (const segment of pointer === '' ? [] : pointer.slice(1).split('/')) {
     requireThat(!/~(?![01])/u.test(segment));
     const key = segment.replaceAll('~1', '/').replaceAll('~0', '~');
-    requireThat(safeKey(key), 'INVALID_FIELD');
+    requireThat(!credentialSlot(value, key), 'INVALID_FIELD');
+    requireThat(Array.isArray(value) ? /^(0|[1-9]\d*)$/.test(key) && Number.isSafeInteger(Number(key)) : safeKey(key), 'INVALID_FIELD');
     requireThat(value !== null && typeof value === 'object' && Object.hasOwn(value, key), 'FIELD_NOT_FOUND');
     value = value[key];
   }
@@ -93,19 +102,21 @@ export function atPointer(value, pointer) {
 }
 export function projectData(data, projection, secrets) {
   if (!projection) return undefined;
-  requireThat(projection.allowData === true && Array.isArray(projection.fields) && projection.fields.length > 0 && projection.fields.length <= 20 && projection.fields.every(safeKey), 'DATA_APPROVAL_REQUIRED');
-  requireThat(Object.keys(projection).every(key => ['allowData', 'arrayPath', 'fields', 'limit'].includes(key)));
+  requireThat(projection.allowData === true && Array.isArray(projection.fields) && projection.fields.length > 0 && projection.fields.length <= 20 && projection.fields.every(fieldPath), 'DATA_APPROVAL_REQUIRED');
+  requireThat(Object.keys(projection).every(key => ['allowData', 'arrayPath', 'fields', 'limit', 'rootFields'].includes(key)));
+  requireThat(projection.rootFields === undefined || (Array.isArray(projection.rootFields) && projection.rootFields.length <= 20 && projection.rootFields.every(fieldPath)), 'INVALID_FIELD');
   const array = atPointer(data, projection.arrayPath ?? '');
   requireThat(Array.isArray(array), 'ARRAY_NOT_FOUND');
   const limit = projection.limit ?? 10;
   requireThat(Number.isInteger(limit) && limit >= 1 && limit <= 100);
   rememberSecrets(data, secrets);
-  requireThat(projection.fields.every(key => !hasSecret(key, secrets)), 'INVALID_FIELD');
+  requireThat([...projection.fields, ...(projection.rootFields ?? [])].every(key => !hasSecret(key, secrets)), 'INVALID_FIELD');
+  const selected = (value, fields) => Object.fromEntries(fields.map(key => [key, previewValue(atPointer(value, '/' + key.split('.').join('/')), secrets)]));
   return { totalInResponse: array.length, returned: Math.min(array.length, limit), truncated: array.length > limit,
+    ...(projection.rootFields ? { root: selected(data, projection.rootFields) } : {}),
     rows: array.slice(0, limit).map(row => {
       requireThat(row && typeof row === 'object' && !Array.isArray(row), 'INVALID_ROW');
-      requireThat(projection.fields.every(key => Object.hasOwn(row, key)), 'FIELD_NOT_FOUND');
-      return Object.fromEntries(projection.fields.map(key => [key, previewValue(row[key], secrets)]));
+      return selected(row, projection.fields);
     }) };
 }
 const editable = /^(page|pageno|pagenumber|pageindex|pagesize|size|limit|offset|cursor|after|before|start|end|startdate|enddate|starttime|endtime|datefrom|dateto|from|to|date)$/;
@@ -123,10 +134,11 @@ export function changedRequest(record, patch = {}) {
       requireThat(object && typeof object === 'object' && !Array.isArray(object));
     }
     for (const [key, value] of Object.entries(changes)) {
-      requireThat(safeKey(key) && editable.test(key.replaceAll('_', '').toLowerCase()), 'PATCH_FIELD_DENIED');
+      const parts = key.split('.'), leaf = parts.at(-1);
+      requireThat(fieldPath(key) && safeKey(leaf) && editable.test(leaf.replaceAll('_', '').toLowerCase()), 'PATCH_FIELD_DENIED');
       requireThat((typeof value === 'string' && value.length <= 2048) || (typeof value === 'number' && Number.isFinite(value)), 'INVALID_PATCH');
-      if (area === 'query') { requireThat(url.searchParams.getAll(key).length === 1, 'FIELD_NOT_FOUND'); url.searchParams.set(key, String(value)); }
-      else { requireThat(Object.hasOwn(object, key), 'FIELD_NOT_FOUND'); object[key] = value; }
+      if (area === 'query') { requireThat(parts.length === 1, 'PATCH_FIELD_DENIED'); requireThat(url.searchParams.getAll(key).length === 1, 'FIELD_NOT_FOUND'); url.searchParams.set(key, String(value)); }
+      else { const parent = atPointer(object, parts.length > 1 ? '/' + parts.slice(0,-1).join('/') : ''); requireThat(parent && typeof parent === 'object' && Object.hasOwn(parent, leaf), 'FIELD_NOT_FOUND'); parent[leaf] = value; }
     }
     if (area === 'json') body = JSON.stringify(object);
   }

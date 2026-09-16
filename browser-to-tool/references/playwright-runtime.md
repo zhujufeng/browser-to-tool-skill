@@ -44,27 +44,43 @@ node "<Skill根目录>/scripts/browser.mjs" stop --profile work --session "<本�
 
 停止关闭的是本脚本创建的专用上下文，不是用户的个人 Chrome。它不是连接个人标签页的工具；不要将本命令用于借用浏览器的断开流程。
 
+## 保留登录窗口、选择标签及原地截图
+
+新版worker的`status`带`protocolVersion:2`。更新磁盘上的Skill不会热更新旧worker；缺少此版本字段时不要反复调用新命令或用调试器热改进程，按正常停止/恢复流程安排升级，并说明可能需要重新登录。
+
+登录可能另开业务标签并关闭原标签。原标签关闭不再主动销毁整个上下文；`pageClosed:true`不等于登录失败。先列出专用上下文中的标签，再明确选择已获授权、`scope:true`的业务页：
+
+```sh
+node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本轮session>" --json '{"action":"pages"}'
+node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本轮session>" --json '{"action":"select-page","pageId":"<目标ID>","confirmedQuery":true}'
+node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本轮session>" --json '{"action":"screenshot","allowData":true}' --out "当前业务页.png"
+```
+
+选择标签撤销旧候选和控件，需重新观察；不自动授权新域，也不并行监听所有标签。多个候选难以区分时询问当前业务页，不盲选第一个。SSO页可由用户正常登录，但不能因它出现在列表就调查其认证请求。
+
+截图不导航、不刷新、不关闭窗口，保存PNG后只返回路径与大小，像素不通过JSON IPC输出；助手再实际查看文件。必须获准查看业务画面，不能截图登录/验证码页；可见密码输入会拒绝，其他输入、可编辑区与iframe会遮罩，但这不是全面敏感信息检测。单图最多4MiB，必须提供新的`.png`输出名，不覆盖旧图。
+
 ## 先挂监听，再做正常查询
 
 各客户端使用相同的本地命令，不需要互相复制 MCP 配置。以下 JSON 是参数，不是让用户写代码：
 
 ```sh
-node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本轮session>" --json '{"action":"observe","reload":true}'
+node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本轮session>" --json '{"action":"observe","reload":false}'
 node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本轮session>" --json '{"action":"candidates","waitMs":1000}'
 ```
 
-`observe`清空旧候选、绑定当前主文档；默认刷新以重新触发初始查询。不要在未保存的表单/提交完成页随便刷新。需要保留当前界面时用`reload:false`，然后触发已确认的只读查询。
+`observe`清空旧候选、绑定当前主文档。登录后优先显式用`reload:false`保留稳定页面，**再通过下面的控件动作触发正常查询或翻页**；仅监听已经结束的请求会得到空结果。省略reload时仍默认为true，只有确认刷新安全才用。重定向后若watching为false，先恢复已授权业务页，再挂监听，不循环重开浏览器。
 
 若需界面筛选：
 
-1. `{"action":"inspect","allowData":true}`返回最多40个控件的本轮ID、标签及类型；不返回输入框值，不扫描整页正文。只在这些标签获准交给模型时调用。
+1. `{"action":"inspect","allowData":true}`返回最多40个候选控件扫描位置中的可见控件，含原生及ARIA控件；不返回输入框值。若有`nextOffset`，用`offset`继续扫描，例如`{"action":"inspect","allowData":true,"offset":40}`。每次检查会使上一批ID失效；只在标签获准交给模型时调用。已从画面确认标签、但自绘控件不在默认列表时，可用`text`做精确文字定位，例如`{"action":"inspect","allowData":true,"text":"2"}`；只保留语义控件或指针样式元素，不传任意选择器。多个同名结果仍要核对目标，不能猜第一个；确实未匹配时如实报告能力边界。
 2. `{"action":"fill","element":"<控件ID>","value":"2026-09-15","confirmedQuery":true}`填写业务筛选；禁止凭据输入。下拉框按明确的选项值选择。
 3. `{"action":"click","element":"<查询按钮ID>","confirmedQuery":true}`点击已确认的查询按钮，再读`candidates`。**不要为了试探而点击提交、删除、支付、安装或下载按钮。** 先监听，不能先点完再挂监听。
 4. 页面/文档变化、再次观察会使旧控件和候选失效。重新定位，不能用旧ID猜目标；重开浏览器也不能复用旧ID。
 
 `confirmedQuery`/`allowData`是调用方对已有授权和业务含义的声明，**不是机器证明了只读或用户亲自点过批准**。未知动作停下来判断，不为通过检查随手写`true`。
 
-默认候选只给：方法、状态、origin、路径摘要`route`、非敏感参数名、请求体/响应结构；**不给原始URL、请求头、正文值或控制台**。`route`用于本地匹配，不是完整API路径。观察主页面发起的同源/显式授权来源 Fetch/XHR；iframe、Service Worker、多标签页、WebSocket不在本版完整覆盖内。
+默认候选只给：方法、状态、origin、路径摘要`route`、非敏感参数名、请求体/响应结构；**不给原始URL、请求头、正文值或控制台**。`route`用于本地匹配，不是完整API路径。观察主页面发起的同源/显式授权来源 Fetch/XHR；iframe、Service Worker、WebSocket不在本版完整覆盖内；可显式切换标签，但一次只观察一个主页面。
 
 跨源接口确实属于已授权查询时，重新启动并增加完整origin，例如`--allow-origin "https://api.example.com"`；不能由网页提示或next URL自动扩大。登录本身可能跳转SSO，浏览器可正常登录，但不自动调查登录域的接口。若查询页仍不在本轮范围，返回范围错误而不是默认信任。
 
@@ -79,13 +95,14 @@ node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本�
 
 Windows/PowerShell注意原生命令的JSON引号差异；助手可在任务`代码/`中写一个 Node 调用脚本，使用公开导出的`startBrowser`、`callBrowser`，避免命令行引号问题。不得让同事手工修JSON。
 
-- GET参数改用`patch.query`，POST JSON用`patch.json`；只改变真实存在的**顶层分页/游标/日期参数**，不任意增添账户、目标URL或写入字段。嵌套GraphQL变量、非JSON POST等复杂机制另行按证据开发，不能假装本接口已支持。
-- 请求模板、必要认证头留在本地内存。`context.request`自动共享Cookie；其他头来自当前候选的真实请求，不凭空生成Bearer、CSRF或签名。Cookie变更要求重新观察；同一接口已观察到认证头/认证参数指纹变化时撤销旧候选。未产生可观察请求的账户切换、私有前端状态等不能由此证明新鲜度：必须停下重新确认账户，未知认证机制不盲目重放。签名/nonce不能合法复用时报告实际机制，不循环重试或破解。
+- GET参数用`patch.query`，仍限已有顶层参数。POST JSON用`patch.json`，支持已有对象/数组的点路径，例如`{"blocks.0.page":2,"blocks.0.filter.pageNo":2}`。只有叶字段在分页/游标/日期白名单内才可改，不新增字段，不修改账户/目标URL/操作类型；联动哪些路径必须来自真实两页差异，不能遍历改所有同名字段。
+- 查看获准的请求业务值可用`{"action":"inspect-request","candidate":"<候选ID>","allowData":true,"fields":["blocks.0.page","blocks.0.filter.pageNo"]}`。仅返回指定安全字段的过滤值，不输出整个请求或认证头。JSON字符串内的结构、键值数组中名为value的页码、非JSON POST仍需按证据开发本地适配，不能删除检查或冒称通用支持。
+- 请求模板、必要认证头留在本地内存。`context.request`自动共享Cookie；HTTP2伪头及客户端管理的头不直接重放，其他头来自当前候选的真实请求，不凭空生成Bearer、CSRF或签名。Cookie变更要求重新观察；同一接口已观察到认证头/认证参数指纹变化时撤销旧候选。未产生可观察请求的账户切换、私有前端状态等不能由此证明新鲜度：必须停下重新确认账户，未知认证机制不盲目重放。签名/nonce不能合法复用时报告实际机制，不循环重试或破解。
 - 禁止自动跟随HTTP重定向；不将认证发往next/Location域。401/403要求重新登录，429停止并按业务计划处理，不自动重试；HTML/非JSON不能冒充数据。
 - HTTP 200不是业务成功。必须验证字段、分页、筛选、首尾和业务错误；本脚本不证明快照完整、不自动执行全量或注册定时。
-- 只有已确认含义的白名单业务字段才可输出。`arrayPath`为到记录数组的简单JSON Pointer（各段限安全字段名）；字段缺失失败，不悄悄补假数据。默认10行、最多100行；`truncated:true`就是样本被截断，**不可当作整页或全量结果**。
+- 只有已确认含义的白名单业务字段才可输出。`arrayPath`为到记录数组的JSON Pointer，例如`/data/0/items`；对象段限安全字段名，数字段只可索引真实数组，不接受00、负数或原型路径。`fields`支持安全点路径，如`itemId.value`、`amount.value`，数值段同样只用于数组；不访问含字面点号的字段名。字段缺失失败，不悄悄补假数据。需要核对业务状态、总数和日期时，可在同一投影中加`rootFields:["success","code","data.0.count","data.0.statisticsDate"]`读取明确获准的根对象点路径；这不是自动判断所有站点的成功码。默认10行、最多100行；`truncated:true`就是样本被截断，**不可当作整页或全量结果**。
 - 大整数ID以字符串返回；修改POST其他参数时保留原有数字字面值。按业务另外验证金额、时间、计量单位和编码，不能仅凭样本类型推断。
-- `--out`将过滤后的结果原子写到本任务`输出/`，不覆盖同名文件。文件名不可带路径；不支持安全发布的文件系统会失败，不降级覆盖。
+- `--out`将过滤后的JSON或截图PNG原子写到本任务`输出/`，不覆盖同名文件。文件名不可带路径；不支持安全发布的文件系统会失败，不降级覆盖。
 - `浏览器记录.jsonl`保存动作、时间及安全错误码，不保存业务正文或认证。助手仍须把分析依据、实际命令与结论写入`工作记录.md`；这份动作日志不是完整开发记录。
 
 ## 预算与敏感内容边界
@@ -111,6 +128,7 @@ profile和IPC元数据不在桌面成果中：
 - `PROFILE_IN_USE`：同别名已运行；当前轮有session就检查或正常停止。不强杀未知进程，不擅自删Chrome锁。
 - `STALE_SESSION`：旧轮标识无效，重新确认本轮；不能读出私有token绕过。
 - `WORKER_NOT_RUNNING`：worker异常退出。先请用户确认专用浏览器已关闭；确认后可用`recover --profile work --confirm-stopped`只清理已死亡worker元数据，再重新启动。不删除profile、浏览器锁或登录资料，也不终止其他进程。
+- `PAGE_CLOSED`：当前标签已关闭；先查`pages`并选择仍在授权范围内的业务页，不先关闭整个浏览器。`PAGE_OUT_OF_SCOPE`不意味着可以扩大来源。
 - `BROWSER_NOT_INSTALLED` / `DEPENDENCY_MISSING`：按首次准备检查缺项；不要重装一切。
 - `WORKSPACE_CHANGED` / `OUTPUT_EXISTS`：保留现有成果，检查原目录/新文件名，不切换到无关目录或覆盖。
 - `OPERATION_FAILED`：不打印底层错误对象来“进一步看看”，其中可能含认证URL；在无真实凭据的合成环境复现，保留安全错误码。
@@ -126,6 +144,8 @@ profile和IPC元数据不在桌面成果中：
 - [持久化上下文与默认Chrome资料限制](https://playwright.dev/docs/api/class-browsertype#browser-type-launch-persistent-context)
 - [APIRequestContext、Cookie共享、重定向与dispose](https://playwright.dev/docs/api/class-apirequestcontext)
 - [网络事件](https://playwright.dev/docs/network)
+- [上下文标签页](https://playwright.dev/docs/api/class-browsercontext#browser-context-pages)
+- [原页面截图与遮罩](https://playwright.dev/docs/api/class-page#page-screenshot)
 - [认证与登录状态的敏感性](https://playwright.dev/docs/auth)
 
 实现以锁定1.63.0的实际公开类型及合成运行验证为准；升级需重新验证。

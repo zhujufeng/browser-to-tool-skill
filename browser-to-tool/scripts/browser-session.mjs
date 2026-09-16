@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { mkdirSync, lstatSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { BrowserFault, requireThat, allowedURL, urlSummary, digest, MAX_BODY, parseData, dataShape, rememberSecrets, projectData, changedRequest, previewValue, authenticationFingerprint } from './browser-data.mjs';
+import { BrowserFault, requireThat, allowedURL, urlSummary, digest, MAX_BODY, parseData, dataShape, rememberSecrets, projectData, changedRequest, previewValue, authenticationFingerprint, replayHeaders } from './browser-data.mjs';
 
 const cookieKey = value => digest((value ?? '').split(';').map(part => part.trim()).filter(Boolean).sort().join(';'));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -26,21 +26,16 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
     if (/ProcessSingleton|SingletonLock|profile.*in use|existing browser session|现有的浏览器会话/i.test(error.message)) throw new BrowserFault('PROFILE_IN_USE');
     throw new BrowserFault('BROWSER_START_FAILED');
   }
-  const page = context.pages()[0] ?? await context.newPage();
+  let page = context.pages()[0] ?? await context.newPage();
   let closePromise, closed = false, watching = false, epoch = 0, armReload = false, omitted = 0, bodyBytes = 0, busy = false;
-  const records = new Map(), pending = new Set(), secrets = new Set(), requests = new WeakMap(), controls = new Map(), authIdentities = new Map();
-  const inScope = () => { try { allowedURL(page.url(), scope); return true; } catch { return false; } };
+  const records = new Map(), pending = new Set(), secrets = new Set(), requests = new WeakMap(), controls = new Map(), authIdentities = new Map(), pageIds = new Map();
+  const pageInScope = target => { try { if (target.isClosed()) return false; allowedURL(target.url(), scope); return true; } catch { return false; } };
+  const inScope = () => pageInScope(page);
   function releaseControls() { for (const { handle } of controls.values()) void handle.dispose().catch(() => {}); controls.clear(); }
-  function revoke() { epoch++; watching = false; records.clear(); authIdentities.clear(); bodyBytes = 0; releaseControls(); }
-  page.on('framenavigated', frame => {
-    if (frame !== page.mainFrame()) return;
-    revoke();
-    watching = armReload && inScope(); armReload = false;
-  });
+  function revoke() { epoch++; watching = false; armReload = false; records.clear(); authIdentities.clear(); bodyBytes = 0; releaseControls(); }
   context.on('close', () => { closed = true; revoke(); });
-  page.on('close', () => { closed = true; revoke(); void context.close().catch(() => {}); });
-  const status = () => ({ closed, watching, epoch, scope: inScope(), page: urlSummary(page.url(), secrets), candidates: records.size, omitted, pending: pending.size, busy });
-  function live(version = epoch) { requireThat(!closed, 'BROWSER_CLOSED'); requireThat(version === epoch && inScope(), 'STALE_SCOPE'); }
+  const status = () => ({ protocolVersion: 2, closed, pageClosed: page.isClosed(), pageId: pageIds.get(page), openPages: pageIds.size, watching, epoch, scope: inScope(), page: urlSummary(page.url(), secrets), candidates: records.size, omitted, pending: pending.size, busy });
+  function live(version = epoch) { requireThat(!closed, 'BROWSER_CLOSED'); requireThat(!page.isClosed(), 'PAGE_CLOSED'); requireThat(version === epoch && inScope(), 'STALE_SCOPE'); }
 
   async function learnResponse(response, target) {
     for (const header of await response.headersArray()) rememberSecrets({ [header.name]: header.value }, secrets);
@@ -58,6 +53,7 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
       if (body && Buffer.byteLength(body) > 65536) { omitted++; return; }
       let bodyData;
       if (body) { try { bodyData = parseData(body); } catch {} }
+      if (bodyData !== undefined) rememberSecrets(bodyData, secrets);
       const identity = request.method() + requestURL.origin + requestURL.pathname;
       const fingerprint = authenticationFingerprint(headers, [...requestURL.searchParams].map(([key, value]) => ({ [key]: value })), bodyData);
       live(version);
@@ -77,7 +73,6 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
       live(version);
       if (!watching) return;
       rememberSecrets(data, secrets);
-      if (body) { try { rememberSecrets(parseData(body), secrets); } catch {} }
       const id = randomUUID();
       bodyBytes += buffer.length;
       records.set(id, { id, epoch: version, url: request.url(), method: request.method(), headers, body, data, cookie: cookieKey(headers.cookie), status: code });
@@ -88,14 +83,22 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
       }
     }
   }
-  page.on('request', request => {
+  function attachPage(target) {
+  pageIds.set(target, randomUUID());
+  target.on('framenavigated', frame => {
+    if (target !== page || frame !== page.mainFrame()) return;
+    const requestedReload = armReload;
+    revoke(); watching = requestedReload && inScope();
+  });
+  target.on('close', () => { pageIds.delete(target); if (target === page) revoke(); });
+  target.on('request', request => {
     try {
       if (watching && !closed && inScope() && ['fetch', 'xhr'].includes(request.resourceType()) && request.frame() === page.mainFrame()) {
         allowedURL(request.url(), scope); requests.set(request, epoch);
       }
     } catch { /* 非授权来源和不支持的frame不纳入调查。 */ }
   });
-  page.on('requestfinished', request => {
+  target.on('requestfinished', request => {
     try {
       const version = requests.get(request);
       if (!watching || closed || version === undefined || version !== epoch || !inScope()) return;
@@ -104,23 +107,29 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
       void job.finally(() => pending.delete(job));
     } catch { omitted++; }
   });
+  }
+  for (const target of context.pages()) attachPage(target);
+  context.on('page', attachPage);
 
-  const describe = element => ({ tag: element.tagName.toLowerCase(), type: element.getAttribute('type') ?? '', label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.textContent || element.getAttribute('name') || element.id || '').trim(), href: element.getAttribute('href') ?? '' });
-  async function inspect({ allowData } = {}) {
+  const describe = element => ({ tag: element.tagName.toLowerCase(), type: element.getAttribute('type') ?? '', label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.textContent || element.getAttribute('name') || element.id || '').trim(), href: element.getAttribute('href') ?? '', interactive: element.matches('button,a,input,textarea,select,[role=button],[role=tab],[role=radio],[role=option]') || getComputedStyle(element).cursor === 'pointer' });
+  async function inspect({ allowData, offset = 0, text } = {}) {
     live(); requireThat(allowData === true, 'DATA_APPROVAL_REQUIRED');
+    requireThat(Number.isInteger(offset) && offset >= 0 && offset <= 10000);
     const version = epoch; releaseControls();
     rememberSecrets({ cookie: (await context.cookies(page.url())).map(cookie => `${cookie.name}=${cookie.value}`).join(';') }, secrets);
-    const elements = page.locator('button, a, input:not([type=hidden]):not([type=password]), textarea, select');
+    requireThat(text === undefined || (typeof text === 'string' && text.trim().length > 0 && text.length <= 120 && previewValue(text, secrets) === text), 'INVALID_INPUT');
+    const elements = text === undefined ? page.locator(':is(button,a,input,textarea,select,[role=button],[role=tab],[role=radio],[role=option]):not([type=hidden]):not([type=password])') : page.getByText(text, { exact: true });
     const count = await elements.count(), items = [];
-    for (let i = 0; i < Math.min(count, 40); i++) {
+    for (let i = offset; i < Math.min(count, offset + 40); i++) {
       const handle = await elements.nth(i).elementHandle();
       if (!handle) continue;
       if (!await handle.isVisible()) { await handle.dispose(); continue; }
       const info = await handle.evaluate(describe); live(version);
+      if (text !== undefined && (!info.interactive || /^(password|hidden)$/i.test(info.type))) { await handle.dispose(); continue; }
       const id = randomUUID(); controls.set(id, { handle, fingerprint: digest(JSON.stringify(info)), epoch: version });
       items.push({ id, tag: info.tag, type: previewValue(info.type, secrets), label: previewValue(info.label.slice(0, 241), secrets) });
     }
-    live(version); return { controls: items, truncated: count > 40 };
+    live(version); return { controls: items, truncated: count > offset + 40, nextOffset: count > offset + 40 ? offset + 40 : null };
   }
   async function interact({ element, confirmedQuery, value }, action) {
     live(); requireThat(confirmedQuery === true, 'QUERY_CONFIRMATION_REQUIRED');
@@ -176,7 +185,7 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
     const cookies = await context.cookies(target);
     live(version);
     requireThat(cookieKey(cookies.map(cookie => `${cookie.name}=${cookie.value}`).join(';')) === record.cookie, 'SESSION_CHANGED');
-    const headers = Object.fromEntries(Object.entries(record.headers).filter(([key]) => !/^(cookie|host|connection|content-length|accept-encoding|proxy-.*|sec-.*)$/i.test(key)));
+    const headers = replayHeaders(record.headers);
     let response, result;
     try {
       response = await context.request.fetch(target, { method: record.method, headers, ...(body === undefined ? {} : { data: body }), timeout, maxRedirects: 0, maxRetries: 0 });
@@ -201,13 +210,33 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
   async function execute(command) {
     requireThat(command && typeof command === 'object' && !Array.isArray(command));
     const { action, ...args } = command;
-    const fields = { status: [], stop: [], observe: ['reload'], candidates: ['waitMs'], query: ['candidate', 'confirmedQuery', 'patch', 'projection'], inspect: ['allowData'], click: ['element', 'confirmedQuery'], fill: ['element', 'confirmedQuery', 'value'] };
+    const fields = { status: [], stop: [], pages: [], 'select-page': ['pageId', 'confirmedQuery'], screenshot: ['allowData'], 'inspect-request': ['candidate', 'allowData', 'fields'], observe: ['reload'], candidates: ['waitMs'], query: ['candidate', 'confirmedQuery', 'patch', 'projection'], inspect: ['allowData', 'offset', 'text'], click: ['element', 'confirmedQuery'], fill: ['element', 'confirmedQuery', 'value'] };
     requireThat(Object.hasOwn(fields, action), 'UNKNOWN_ACTION');
     requireThat(Object.keys(args).every(key => fields[action].includes(key)));
     if (action === 'status') return status();
     if (action === 'stop') { await close(); return { stopped: true }; }
     requireThat(!busy, 'BUSY'); busy = true;
     try {
+      if (action === 'pages') return { pages: [...pageIds].map(([target,id]) => ({ id, current: target === page, scope: pageInScope(target), ...urlSummary(target.url(), secrets) })) };
+      if (action === 'select-page') {
+        requireThat(!closed, 'BROWSER_CLOSED'); requireThat(args.confirmedQuery === true, 'QUERY_CONFIRMATION_REQUIRED');
+        const target = [...pageIds].find(([,id]) => id === args.pageId)?.[0];
+        requireThat(target && pageInScope(target), 'PAGE_OUT_OF_SCOPE');
+        revoke(); page = target; return status();
+      }
+      if (action === 'screenshot') {
+        live(); requireThat(args.allowData === true, 'DATA_APPROVAL_REQUIRED'); const version = epoch;
+        requireThat(await page.locator('input[type=password]').filter({ visible: true }).count() === 0, 'SENSITIVE_PAGE');
+        const png = await page.screenshot({ type: 'png', fullPage: false, mask: [page.locator('input,textarea,:read-write,iframe')], timeout });
+        live(version); requireThat(png.byteLength <= 4 * MAX_BODY, 'SCREENSHOT_TOO_LARGE');
+        return { format: 'png', bytes: png.byteLength, epoch: version, png };
+      }
+      if (action === 'inspect-request') {
+        live(); const record = records.get(args.candidate); requireThat(record && record.epoch === epoch, 'CANDIDATE_NOT_FOUND');
+        let body; try { body = parseData(record.body); } catch { throw new BrowserFault('JSON_BODY_REQUIRED'); }
+        const preview = projectData({ request: [body] }, { allowData: args.allowData, arrayPath: '/request', fields: args.fields, limit: 1 }, secrets);
+        return { method: record.method, ...urlSummary(record.url, secrets), fields: preview.rows[0] };
+      }
       if (action === 'inspect') return await inspect(args);
       if (action === 'click' || action === 'fill') return await interact(args, action);
       if (action === 'observe') return await observe(args);
@@ -226,5 +255,5 @@ export async function openBrowserSession({ profileDir, url, origins = [], headle
   try { await page.goto(initial.href, { waitUntil: 'domcontentloaded', timeout }); }
   catch { await close(); throw new BrowserFault('NAVIGATION_FAILED'); }
   // context/page仅供本地集成测试和同进程编程；CLI不向模型提供任意evaluate或Cookie导出。
-  return { context, page, execute, close, status };
+  return { context, get page() { return page; }, execute, close, status };
 }

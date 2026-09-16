@@ -133,7 +133,8 @@ async function worker(options) {
     finally { closeSync(log); }
   }
   function outputFile(name, result) {
-    requireThat(typeof name === 'string' && /^(?!\.)[\p{L}\p{N}_ .-]{1,90}\.json$/u.test(name), 'INVALID_OUTPUT_NAME');
+    const image = Buffer.isBuffer(result);
+    requireThat(typeof name === 'string' && (image ? /^(?!\.)[\p{L}\p{N}_ .-]{1,90}\.png$/u : /^(?!\.)[\p{L}\p{N}_ .-]{1,90}\.json$/u).test(name), 'INVALID_OUTPUT_NAME');
     requireThat(!runtime.status().closed, 'BROWSER_CLOSED'); workspaceLive();
     const parent = join(workspace, '输出'); mkdirSync(parent, { mode: 0o700, recursive: true });
     requireThat(lstatSync(parent).isDirectory() && !lstatSync(parent).isSymbolicLink(), 'UNSAFE_OUTPUT_DIRECTORY');
@@ -141,7 +142,7 @@ async function worker(options) {
     let file;
     try {
       file = safeOpen(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeFileSync(file, JSON.stringify(result, null, 2) + '\n'); closeSync(file); file = undefined;
+      writeFileSync(file, image ? result : JSON.stringify(result, null, 2) + '\n'); closeSync(file); file = undefined;
       // hard link原子发布且不覆盖；不支持时明确失败，不降级为覆盖rename。
       linkSync(temp, target);
     } catch (error) { throw new BrowserFault(error.code === 'EEXIST' ? 'OUTPUT_EXISTS' : 'OUTPUT_WRITE_FAILED'); }
@@ -190,17 +191,22 @@ async function worker(options) {
         for await (const chunk of request) { bytes += chunk.length; requireThat(bytes <= MAX_MESSAGE, 'INPUT_TOO_LARGE'); chunks.push(chunk); }
         let message; try { message = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new BrowserFault('INVALID_INPUT'); }
         requireThat(message && Object.keys(message).every(key => ['session', 'command', 'output'].includes(key)) && message.session === entry.session, 'STALE_SESSION');
-        action = ['status', 'stop', 'observe', 'candidates', 'query', 'inspect', 'click', 'fill'].includes(message.command?.action) ? message.command.action : 'invalid';
+        action = ['status', 'stop', 'pages', 'select-page', 'screenshot', 'inspect-request', 'observe', 'candidates', 'query', 'inspect', 'click', 'fill'].includes(message.command?.action) ? message.command.action : 'invalid';
         requireThat(runtime && !closing, 'NOT_READY');
+        const image = message.command?.action === 'screenshot';
+        requireThat(!image || message.output, 'SCREENSHOT_OUTPUT_REQUIRED');
         if (message.output) {
-          requireThat(['query', 'candidates', 'inspect'].includes(message.command?.action), 'INVALID_OUTPUT_ACTION');
-          requireThat(typeof message.output === 'string' && /^(?!\.)[\p{L}\p{N}_ .-]{1,90}\.json$/u.test(message.output), 'INVALID_OUTPUT_NAME');
+          requireThat(['query', 'candidates', 'inspect', 'inspect-request', 'screenshot'].includes(message.command?.action), 'INVALID_OUTPUT_ACTION');
+          requireThat(typeof message.output === 'string' && (image ? /^(?!\.)[\p{L}\p{N}_ .-]{1,90}\.png$/u : /^(?!\.)[\p{L}\p{N}_ .-]{1,90}\.json$/u).test(message.output), 'INVALID_OUTPUT_NAME');
           requireThat(!existsSync(join(workspace, '输出', message.output)), 'OUTPUT_EXISTS');
         }
         touch();
-        const result = await runtime.execute(message.command);
+        const version = runtime.status().epoch;
+        let result = await runtime.execute(message.command);
         requireThat(!response.destroyed, 'CLIENT_DISCONNECTED');
-        const savedTo = message.output ? outputFile(message.output, result) : undefined;
+        if (message.output) requireThat(runtime.status().epoch === version && runtime.status().scope, 'STALE_SCOPE');
+        const savedTo = message.output ? outputFile(message.output, image ? result.png : result) : undefined;
+        if (image) { const { png, ...metadata } = result; result = metadata; }
         record(message.command.action, true);
         send({ ok: true, result: savedTo ? { ...result, savedTo } : result });
         if (message.command.action === 'stop') void shutdown().catch(() => {}); else if (!closing) touch();
