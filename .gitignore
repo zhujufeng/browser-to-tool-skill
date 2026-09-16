@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+node_modules/
+.env
+.env.*
+*.zip
+/工作记录.md
+/输出/
+/代码/
+/会话/
+/runtime/
