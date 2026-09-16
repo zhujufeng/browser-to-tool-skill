@@ -25,6 +25,7 @@
 | 情况 | 处理 |
 |---|---|
 | 没有Node/Python/Git | 仍可读取Skill、建目录、记录需求和选择方案；按实际需要准备，不全装 |
+| 需要配套Playwright浏览器 | 先读[实际运行说明](playwright-runtime.md)，检测Node 22+及npm；获准后按锁文件安装Playwright与专用Chromium。不复制个人Chrome；Windows运行器暂禁用，不能取消检查绕过 |
 | 没有Node，但需要Chrome DevTools MCP | 征得同意后准备官方支持的Node LTS及其npm/npx，再配置MCP |
 | 没有Python，但选择Python交付 | 先考虑已有运行时或更简单形式；仍最适合Python时协助准备解释器及任务目录内虚拟环境 |
 | 没有Git | 普通工具开发不要求Git；没有版本控制也不阻止保存代码，不强制初始化仓库 |

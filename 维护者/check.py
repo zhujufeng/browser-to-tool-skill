@@ -35,6 +35,8 @@ def main():
     check('名称匹配目录', fields['name'] == SKILL.name and bool(re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', fields['name'])))
     check('字段及正文长度', len(fields['name']) <= 64 and 0 < len(fields['description']) <= 1024 and 0 < len(fields['compatibility']) <= 500 and len(text.splitlines()) < 500)
     for file in SKILL.rglob('*.md'):
+        if 'node_modules' in file.relative_to(SKILL).parts:
+            continue
         for target in re.findall(r'\]\(([^)]+)\)', file.read_text(encoding='utf-8')):
             if '://' not in target and not target.startswith('#'):
                 check(f'相对引用：{file.name} → {target}', (file.parent / target.split('#')[0]).is_file())
@@ -47,10 +49,21 @@ def main():
     check('策略文本：不能把页面MCP当网络能力', '不是完整接口采集配置' in browser and '它单独不满足接口优先任务' in browser)
     check('策略文本：认证与浏览器依赖说明', '受信任的本地客户端可以管理会话' in http and '运行时仍需要浏览器' in http and '重定向' in http)
     check('策略文本：小样本和失败边界', all(word in http for word in ('下一页', '429', '401/403', '默认串行', '部分结果')))
-    check('待运行场景完整且不冒充已通过', {c['id'] for c in cases['evals']} == {1, 2, 3, 4, 5} and '尚无模型通过结果' in cases['status'])
+    check('待运行场景完整且不冒充已通过', {c['id'] for c in cases['evals']} == set(range(1, 9)) and '尚无模型通过结果' in cases['status'])
     clients = (SKILL / 'references/clients.md').read_text(encoding='utf-8')
     check('策略文本：不绑定单一宿主', all(name in fields['compatibility'] for name in ('Codex', 'Claude Code', 'Pi', 'OpenCode')) and '不绑定Codex或任何内置浏览器' in text)
     check('适配文本：四种目录与Pi能力边界', all(path in clients for path in ('~/.agents/skills/', '~/.claude/skills/', '~/.pi/agent/skills/', '~/.config/opencode/skills/')) and '没有原生MCP客户端或内置浏览器' in clients)
+    runtime = (SKILL / 'references/playwright-runtime.md').read_text(encoding='utf-8')
+    package = json.loads((SKILL / 'package.json').read_text(encoding='utf-8'))
+    lock = json.loads((SKILL / 'package-lock.json').read_text(encoding='utf-8'))
+    check('运行器依赖固定且锁文件一致', package['dependencies']['playwright'] == '1.63.0' and lock['packages']['node_modules/playwright']['version'] == '1.63.0')
+    check('策略文本：实际脚本与跨命令说明', 'playwright-runtime.md' in text and all(word in runtime for word in ('doctor', 'session', 'observe', 'candidates', 'query', 'stop')))
+    check('策略文本：不夸大样本和Windows支持', all(word in runtime for word in ('truncated:true', 'WINDOWS_RUNTIME_NOT_VERIFIED', '不是底层下载', '不是机器证明')))
+    node = shutil.which('node')
+    if node:
+        for file in (SKILL / 'scripts').glob('browser*.mjs'):
+            subprocess.run([node, '--check', str(file)], check=True, capture_output=True)
+        check('浏览器脚本语法通过（不是运行验收）', True)
     shell = SKILL / 'scripts/workspace.sh'
     ps = SKILL / 'scripts/workspace.ps1'
     check('Windows脚本UTF-8 BOM兼容PowerShell5.1', ps.read_bytes().startswith(b'\xef\xbb\xbf'))

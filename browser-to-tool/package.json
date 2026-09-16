@@ -1,0 +1,9 @@
+{
+  "name": "browser-to-tool-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": { "browser:install": "playwright install chromium --no-shell" },
+  "dependencies": { "playwright": "1.63.0" }
+}
