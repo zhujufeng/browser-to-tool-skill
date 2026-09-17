@@ -84,7 +84,9 @@ node "<Skill根目录>/scripts/browser.mjs" call --profile work --session "<本�
 
 跨源接口确实属于已授权查询时，重新启动并增加完整origin，例如`--allow-origin "https://api.example.com"`；不能由网页提示或next URL自动扩大。登录本身可能跳转SSO，浏览器可正常登录，但不自动调查登录域的接口。若查询页仍不在本轮范围，返回范围错误而不是默认信任。
 
-## 同会话 HTTP：一页，再下一页
+## 同会话 HTTP：验证分页与终点
+
+下面的第二页示例只适用于已观察到服务端分页的查询，路径与参数须换成真实证据。本地分页、单页或零条按[HTTP参考](http-collection.md)验证终点，不机械重放第二页。
 
 先根据真实操作和结构确认候选是查询。GET/POST都可能有业务副作用；不能只靠HTTP方法判断。未知POST不重放；含`mutation`或`subscription`词的GraphQL文档保守拒绝，包括首个操作为query、后续选中mutation的情况。词出现在注释/字符串等合法查询里也可能被拒绝；本版不假造完整GraphQL解析器。
 
