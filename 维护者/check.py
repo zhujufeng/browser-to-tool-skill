@@ -49,7 +49,7 @@ def main():
     check('策略文本：不能把页面MCP当网络能力', '不是完整接口采集配置' in browser and '它单独不满足接口优先任务' in browser)
     check('策略文本：认证与浏览器依赖说明', '受信任的本地客户端可以管理会话' in http and '运行时仍需要浏览器' in http and '重定向' in http)
     check('策略文本：小样本和失败边界', all(word in http for word in ('下一页', '429', '401/403', '默认串行', '部分结果')))
-    check('待运行场景完整且不冒充已通过', {c['id'] for c in cases['evals']} == set(range(1, 21)) and '尚无模型通过结果' in cases['status'])
+    check('待运行场景完整且不冒充已通过', {c['id'] for c in cases['evals']} == set(range(1, 24)) and '尚无模型通过结果' in cases['status'])
     check('策略文本：真实分页证据先于模拟结论', all(word in text + http for word in ('真实第一页/第二页', '最大数组', '夹具', '联动')))
     check('策略文本：无新证据的重复失败必须停止', '相同失败再次出现而没有新证据' in text)
     check('路由文本：用途优先而非轮流换浏览器', all(word in browser for word in ('先选用途，再固定通道', '本地预览优先内置浏览器', '隔离测试', '续作时已有通道满足要求就继续')))
